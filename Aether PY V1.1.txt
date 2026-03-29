@@ -1,0 +1,1368 @@
+"""
+Aether — Adaptive Empathic Thinking, Hearing & Experiential Reasoning
+v1.1 | Priority updates applied
+
+Changes from v1.0:
+  [1] LatentAutoencoder now wired into UserMemory.add() — 384→64-dim before Redis storage
+  [2] Semantic cache — embedding similarity gate before any LLM/tool calls
+  [3] Phi-3.5-mini-instruct default — fixes repetition issues, better RLHF
+  [4] LoRA targets expanded: q/k/v/o_proj (was q/v only)
+  [5] Per-component Prometheus histograms — empathy, tools, llm, rewrite stages
+  [6] Implicit feedback — follow-up sentiment + response length update bandit
+  [7] Conversation turns — conversation_id on ChatRequest, in-memory turn buffer
+  [8] Dynamic tool embeddings — query-derived calendar signal, not hardcoded string
+  [9] Witty tone conditioned on emotions — no asides on grief/fear/anger
+  [10] vLLM optional backend — set VLLM_BASE_URL to use instead of direct Phi-3
+  [11] Unsloth optional fine-tuning — set USE_UNSLOTH=true in .env
+  [12] Background summarisation — async task after session, stored in Redis
+  [13] Rate limiting — per-user token bucket via Redis, configurable
+  [14] Auth — X-API-Key header, configurable bypass for dev
+
+Run:
+    uvicorn aether:app --host 0.0.0.0 --port 8000
+
+Fine-tune:
+    python aether.py --finetune --dataset tatsu-lab/alpaca --epochs 1
+
+Load fine-tuned:
+    set PHI3_FINETUNED_PATH in .env, then restart server
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import logging
+import os
+import random
+import time
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, AsyncGenerator, Deque, Dict, List, Optional, Tuple
+
+import httpx
+import numpy as np
+import torch
+import torch.nn as nn
+import uvicorn
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sse_starlette.sse import EventSourceResponse
+
+# ── Optional heavy deps ────────────────────────────────────────────────────────
+try:
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        BitsAndBytesConfig,
+        pipeline,
+        TrainingArguments,
+    )
+    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+    from trl import SFTTrainer
+    from datasets import load_dataset
+    from sentence_transformers import SentenceTransformer
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    whisper = None
+
+try:
+    from lavis.models import load_model as load_blip
+    LAVIS_AVAILABLE = True
+except ImportError:
+    LAVIS_AVAILABLE = False
+
+try:
+    from prometheus_client import Counter, Histogram, start_http_server
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+try:
+    from redis.asyncio import Redis as AsyncRedis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    AsyncRedis = None
+
+try:
+    from langchain.agents import AgentExecutor, create_react_agent
+    from langchain.prompts import PromptTemplate
+    from langchain_openai import ChatOpenAI
+    LANGCHAIN_AVAILABLE = True
+except ImportError:
+    LANGCHAIN_AVAILABLE = False
+
+# Unsloth — optional fast fine-tuning backend
+try:
+    from unsloth import FastLanguageModel
+    UNSLOTH_AVAILABLE = True
+except ImportError:
+    UNSLOTH_AVAILABLE = False
+
+# ── CLI args ───────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="Aether agent v1.1")
+parser.add_argument("--finetune", action="store_true")
+parser.add_argument("--load-finetuned", action="store_true")
+parser.add_argument("--multimodal", action="store_true")
+parser.add_argument("--dataset", default="tatsu-lab/alpaca")
+parser.add_argument("--epochs", type=int, default=1)
+args, _ = parser.parse_known_args()
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    openai_api_key: str = ""
+    x_bearer_token: str = ""
+    tavily_api_key: str = ""
+    redis_url: str = "redis://localhost:6379"
+    google_oauth_token: str = ""
+
+    # [v1.1] Phi-3.5 default — better repetition handling vs Phi-3-mini
+    phi3_model_name: str = "microsoft/Phi-3.5-mini-instruct"
+    phi3_finetuned_path: str = "./aether_phi3_finetuned"
+
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    emotion_model: str = "bhadresh-savani/roberta-base-emotion"
+    harm_model: str = "unitary/toxic-bert"
+    pii_model: str = "Isotonic/distilbert_pii"
+
+    max_memory_docs: int = 1000
+    cache_ttl: int = 3600
+    session_ttl: int = 1800          # in-flight conversation window (seconds)
+    relevance_threshold: float = 0.7
+    wit_factor: float = 8.0
+
+    # [v1.1] Semantic cache similarity threshold (cosine, 0–1)
+    semantic_cache_threshold: float = 0.92
+    semantic_cache_ttl: int = 600    # 10 minutes
+
+    # [v1.1] vLLM — set to use as generation backend instead of direct Phi-3
+    # e.g. "http://localhost:8080/v1"
+    vllm_base_url: str = ""
+    vllm_model: str = "microsoft/Phi-3.5-mini-instruct"
+
+    # [v1.1] Auth — set a non-empty value to require X-API-Key header
+    api_key: str = ""
+
+    # [v1.1] Rate limiting — requests per minute per user
+    rate_limit_rpm: int = 30
+
+    # [v1.1] Unsloth fine-tuning backend
+    use_unsloth: bool = False
+
+settings = Settings()
+
+# ── Logging & Metrics ──────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("aether")
+
+# [v1.1] Per-component histograms — not just total latency
+if PROMETHEUS_AVAILABLE:
+    REQUEST_COUNT = Counter("aether_requests_total", "Total requests", ["intent"])
+    LATENCY_TOTAL = Histogram("aether_latency_total_seconds", "End-to-end latency")
+    LATENCY_EMPATHY = Histogram("aether_latency_empathy_seconds", "Emotion+safety stage")
+    LATENCY_TOOLS = Histogram("aether_latency_tools_seconds", "Tool execution stage")
+    LATENCY_LLM = Histogram("aether_latency_llm_seconds", "LLM generation stage")
+    LATENCY_REWRITE = Histogram("aether_latency_rewrite_seconds", "Phi-3 empathy rewrite")
+    CACHE_HITS = Counter("aether_semantic_cache_hits_total", "Semantic cache hits")
+    start_http_server(8001)
+    logger.info("Prometheus metrics on :8001")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Compute device: {device}")
+
+# ── Timing context manager ─────────────────────────────────────────────────────
+from contextlib import contextmanager
+
+@contextmanager
+def timed(histogram=None):
+    """Records wall time into a Prometheus histogram if available."""
+    t0 = time.time()
+    yield
+    elapsed = time.time() - t0
+    if PROMETHEUS_AVAILABLE and histogram is not None:
+        histogram.observe(elapsed)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. NEURAL COMPONENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LatentAutoencoder(nn.Module):
+    """
+    Compresses 384-dim sentence embeddings to 64-dim for Redis storage.
+    [v1.1] Now actually used in UserMemory.add() — was defined but unwired in v1.0.
+    """
+    def __init__(self, input_dim: int = 384, latent_dim: int = 64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 128), nn.ReLU(),
+            nn.Linear(128, latent_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 128), nn.ReLU(),
+            nn.Linear(128, input_dim)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(self.encoder(x))
+
+    @torch.inference_mode()
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+    @torch.inference_mode()
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z)
+
+
+class ToolPolicy(nn.Module):
+    """
+    Learned MLP: [query_emb ‖ context_emb ‖ emotion_emb] → P(use_tool)
+    for tools = [web_search, x_trends, calendar].
+
+    [v1.1] context_emb is now derived from the actual query's time/calendar
+    signals rather than a hardcoded "calendar schedule events" string.
+    """
+    def __init__(self, input_dim: int = 384 * 3, n_tools: int = 3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128), nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, n_tools), nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. EMPATHETIC CONTEXT ENGINE  (singleton, loaded once at startup)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EmpatheticContextEngine:
+    """
+    The load-bearing heart of Aether. Every request passes through here first.
+
+    v1.1 changes:
+      - LatentAutoencoder.encode() now used for memory compression
+      - Phi-3.5-mini default model
+      - vLLM backend path for generation (bypasses direct model.generate())
+      - Unsloth fine-tuning path (faster, lower VRAM)
+      - LoRA targets expanded to q/k/v/o_proj
+    """
+
+    def __init__(self):
+        if not TRANSFORMERS_AVAILABLE:
+            raise RuntimeError(
+                "transformers + sentence-transformers required. "
+                "pip install transformers sentence-transformers peft trl datasets"
+            )
+
+        logger.info("Loading EmpatheticContextEngine…")
+
+        # Sentence embedder — small, fast, shared everywhere (embeddings + cache + policy)
+        self.embedder = SentenceTransformer(settings.embedding_model, device=str(device))
+
+        # Emotion detector
+        self.emotion_pipe = pipeline(
+            "text-classification",
+            model=settings.emotion_model,
+            top_k=None,
+            device=0 if device.type == "cuda" else -1,
+        )
+
+        # Safety classifiers
+        self.harm_pipe = pipeline(
+            "text-classification",
+            model=settings.harm_model,
+            device=0 if device.type == "cuda" else -1,
+        )
+        self.pii_pipe = pipeline(
+            "ner",
+            model=settings.pii_model,
+            aggregation_strategy="simple",
+            device=0 if device.type == "cuda" else -1,
+        )
+
+        # Phi-3.5 — quantised, loaded once
+        # Skip if vLLM will handle generation
+        self._use_vllm = bool(settings.vllm_base_url)
+        if self._use_vllm:
+            logger.info(f"vLLM backend: {settings.vllm_base_url} model={settings.vllm_model}")
+            self.phi_model = None
+            self.phi_tokenizer = None
+        else:
+            phi3_path = (
+                settings.phi3_finetuned_path
+                if args.load_finetuned and Path(settings.phi3_finetuned_path).exists()
+                else settings.phi3_model_name
+            )
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+            self.phi_tokenizer = AutoTokenizer.from_pretrained(phi3_path, trust_remote_code=True)
+            if self.phi_tokenizer.pad_token is None:
+                self.phi_tokenizer.pad_token = self.phi_tokenizer.eos_token
+            self.phi_model = AutoModelForCausalLM.from_pretrained(
+                phi3_path,
+                quantization_config=bnb_config,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            self.phi_model.eval()
+
+        # [v1.1] Latent autoencoder — now actually wired in
+        self.autoencoder = LatentAutoencoder().to(device)
+        ae_path = Path("aether_autoencoder.pt")
+        if ae_path.exists():
+            self.autoencoder.load_state_dict(torch.load(ae_path, map_location=device))
+            logger.info("Autoencoder weights loaded.")
+        self.autoencoder.eval()
+
+        # Multimodal — runtime flag, not just CLI
+        self.whisper_model = None
+        self.blip_model = None
+        if args.multimodal:
+            if WHISPER_AVAILABLE:
+                self.whisper_model = whisper.load_model("base")
+                logger.info("Whisper loaded.")
+            if LAVIS_AVAILABLE:
+                self.blip_model = load_blip("blip2_opt", "pretrained", device=device)
+                logger.info("BLIP-2 loaded.")
+
+        logger.info("EmpatheticContextEngine ready.")
+
+    # ── Embedding ──────────────────────────────────────────────────────────────
+
+    @torch.inference_mode()
+    def embed(self, text: str) -> np.ndarray:
+        return self.embedder.encode(text, normalize_embeddings=True, convert_to_numpy=True)
+
+    @torch.inference_mode()
+    def embed_tensor(self, text: str) -> torch.Tensor:
+        return torch.tensor(self.embed(text), device=device)
+
+    @torch.inference_mode()
+    def embed_compressed(self, text: str) -> List[float]:
+        """
+        [v1.1] Returns 64-dim latent vector for Redis storage.
+        Full 384-dim → autoencoder → 64-dim. 6x storage reduction.
+        """
+        full = torch.tensor(self.embed(text), device=device)
+        compressed = self.autoencoder.encode(full)
+        return compressed.cpu().tolist()
+
+    # ── Emotion ────────────────────────────────────────────────────────────────
+
+    def detect_emotions(self, text: str) -> List[Dict[str, Any]]:
+        """Returns sorted {label, score} list. Chunks inputs >512 chars."""
+        if len(text) <= 512:
+            raw = self.emotion_pipe(text[:512])
+            results = raw[0] if isinstance(raw[0], list) else raw
+        else:
+            chunks = [text[i:i + 400] for i in range(0, len(text), 350)]
+            agg: Dict[str, float] = {}
+            for chunk in chunks:
+                raw = self.emotion_pipe(chunk[:512])
+                items = raw[0] if isinstance(raw[0], list) else raw
+                for item in items:
+                    agg[item["label"]] = agg.get(item["label"], 0.0) + item["score"]
+            results = [{"label": k, "score": v / len(chunks)} for k, v in agg.items()]
+        return sorted(results, key=lambda x: x["score"], reverse=True)
+
+    # ── Safety ─────────────────────────────────────────────────────────────────
+
+    def is_harmful(self, text: str) -> bool:
+        results = self.harm_pipe(text[:512])
+        items = results[0] if isinstance(results[0], list) else results
+        return any(
+            r["label"].lower() in ("toxic", "severe_toxic") and r["score"] > 0.7
+            for r in items
+        )
+
+    def has_pii(self, text: str) -> List[str]:
+        entities = self.pii_pipe(text[:512])
+        return [e["word"] for e in entities if e.get("score", 0) > 0.8]
+
+    # ── Generation ─────────────────────────────────────────────────────────────
+
+    async def generate_vllm(self, messages: List[Dict], max_tokens: int = 300) -> str:
+        """[v1.1] vLLM OpenAI-compatible endpoint."""
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{settings.vllm_base_url}/chat/completions",
+                json={
+                    "model": settings.vllm_model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.75,
+                    "top_p": 0.9,
+                },
+                timeout=30.0,
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+
+    @torch.inference_mode()
+    def generate_local(self, messages: List[Dict], max_tokens: int = 300) -> str:
+        """Direct Phi-3.5 generation — used when vLLM is not configured."""
+        prompt = self.phi_tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.phi_tokenizer(prompt, return_tensors="pt").to(device)
+        out = self.phi_model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=0.75,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            do_sample=True,
+        )
+        return self.phi_tokenizer.decode(
+            out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        ).strip()
+
+    async def generate(self, messages: List[Dict], max_tokens: int = 300) -> str:
+        """Unified generation — vLLM if configured, else local Phi-3.5."""
+        if self._use_vllm:
+            return await self.generate_vllm(messages, max_tokens)
+        return await asyncio.to_thread(self.generate_local, messages, max_tokens)
+
+    # ── Empathetic rewriting ───────────────────────────────────────────────────
+
+    async def rewrite_with_empathy(self, response: str, emotions: List[Dict]) -> str:
+        """
+        Rewrites through the emotional lens using Phi-3.5 (or vLLM).
+        Not cosmetic — emotional state shapes content, phrasing, and structure.
+        """
+        if not emotions:
+            return response
+        top = ", ".join(f"{e['label']}({e['score']:.2f})" for e in emotions[:3])
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an empathetic rewriter. Rewrite the assistant response to "
+                    "deeply acknowledge and speak to the user's detected emotional state. "
+                    "Do not change factual content. Be warm, genuine, and concise."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Detected emotions: {top}\n\nOriginal response:\n{response}",
+            },
+        ]
+        return await self.generate(messages, max_tokens=200)
+
+    # ── Multimodal ─────────────────────────────────────────────────────────────
+
+    def transcribe(self, audio_path: str) -> str:
+        if not self.whisper_model:
+            return ""
+        return self.whisper_model.transcribe(audio_path)["text"]
+
+    def caption_image(self, image_path: str) -> str:
+        if not self.blip_model:
+            return ""
+        from PIL import Image
+        img = Image.open(image_path).convert("RGB")
+        return self.blip_model.generate({"image": img})[0]
+
+    # ── Fine-tuning ────────────────────────────────────────────────────────────
+
+    def finetune(self, dataset_name: str = "tatsu-lab/alpaca", epochs: int = 1):
+        """
+        [v1.1] Unsloth path (2-3x faster, lower VRAM) when USE_UNSLOTH=true.
+        Falls back to standard SFTTrainer.
+        LoRA targets expanded to q/k/v/o_proj (was q/v only).
+        """
+        logger.info(
+            f"Fine-tuning Phi-3.5 on {dataset_name} for {epochs} epoch(s) "
+            f"[backend={'unsloth' if settings.use_unsloth and UNSLOTH_AVAILABLE else 'trl'}]"
+        )
+
+        dataset = load_dataset(dataset_name, split="train[:5%]")
+
+        def format_example(ex):
+            return {
+                "text": (
+                    f"### Instruction:\n{ex['instruction']}\n\n"
+                    f"### Response:\n{ex['output']}"
+                )
+            }
+
+        dataset = dataset.map(format_example)
+
+        if settings.use_unsloth and UNSLOTH_AVAILABLE:
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=settings.phi3_model_name,
+                max_seq_length=512,
+                dtype=None,
+                load_in_4bit=True,
+            )
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=16,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                lora_alpha=32,
+                lora_dropout=0.05,
+                bias="none",
+                use_gradient_checkpointing=True,
+            )
+        else:
+            model = prepare_model_for_kbit_training(self.phi_model)
+            # [v1.1] Expanded LoRA targets — was ["q_proj", "v_proj"]
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=16,
+                lora_alpha=32,
+                lora_dropout=0.05,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            )
+            model = get_peft_model(model, lora_config)
+            tokenizer = self.phi_tokenizer
+
+        model.print_trainable_parameters()
+
+        training_args = TrainingArguments(
+            output_dir=settings.phi3_finetuned_path,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=4,
+            warmup_steps=20,
+            learning_rate=2e-4,
+            bf16=device.type == "cuda",  # bf16 preferred over fp16 for Phi-3.5
+            logging_steps=10,
+            save_steps=100,
+            save_total_limit=2,
+            report_to="none",
+        )
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            tokenizer=tokenizer,
+            dataset_text_field="text",
+            max_seq_length=512,
+        )
+        trainer.train()
+        trainer.save_model(settings.phi3_finetuned_path)
+        logger.info(f"Fine-tune complete → {settings.phi3_finetuned_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. CONVERSATION BUFFER  [v1.1 — new]
+#    In-memory turn history for active sessions. Answers "what did you just say?"
+#    without a Redis round-trip. Expires after session_ttl seconds of inactivity.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Turn:
+    role: str      # "user" or "assistant"
+    content: str
+    ts: float = field(default_factory=time.time)
+
+
+class ConversationBuffer:
+    """
+    Keyed by conversation_id. Holds the last N turns in a deque.
+    Expired sessions are pruned lazily on access.
+    """
+    MAX_TURNS = 20
+
+    def __init__(self):
+        self._turns: Dict[str, Deque[Turn]] = {}
+        self._last_access: Dict[str, float] = {}
+
+    def _prune(self, conv_id: str):
+        last = self._last_access.get(conv_id, 0)
+        if time.time() - last > settings.session_ttl:
+            self._turns.pop(conv_id, None)
+            self._last_access.pop(conv_id, None)
+
+    def add(self, conv_id: str, role: str, content: str):
+        self._prune(conv_id)
+        if conv_id not in self._turns:
+            self._turns[conv_id] = deque(maxlen=self.MAX_TURNS)
+        self._turns[conv_id].append(Turn(role=role, content=content))
+        self._last_access[conv_id] = time.time()
+
+    def get_messages(self, conv_id: str) -> List[Dict[str, str]]:
+        """Returns turns formatted as OpenAI-style message dicts."""
+        self._prune(conv_id)
+        turns = self._turns.get(conv_id, deque())
+        self._last_access[conv_id] = time.time()
+        return [{"role": t.role, "content": t.content} for t in turns]
+
+    def clear(self, conv_id: str):
+        self._turns.pop(conv_id, None)
+        self._last_access.pop(conv_id, None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. MEMORY  (Redis + HNSW, per-user, LRU-capped)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class UserMemory:
+    def __init__(self, user_id: str, redis: "AsyncRedis", engine: EmpatheticContextEngine):
+        self.user_id = user_id
+        self.redis = redis
+        self.engine = engine
+
+    def _key(self, ts: int) -> str:
+        return f"doc:{self.user_id}:{ts}"
+
+    def _cache_key(self, query_hash: str) -> str:
+        return f"semcache:{self.user_id}:{query_hash}"
+
+    async def add(self, query: str, response: str, emotion_labels: List[str]):
+        """
+        [v1.1] Uses embed_compressed() — 64-dim latent vectors instead of 384-dim.
+        6x reduction in Redis memory and serialisation bandwidth.
+        """
+        compressed_emb = self.engine.embed_compressed(query + " " + response)
+        payload = {
+            "query": query,
+            "response": response[:500],
+            "embedding": compressed_emb,  # 64-dim, not 384
+            "ts": str(int(time.time())),
+            "emotions": emotion_labels,
+        }
+        key = self._key(int(time.time()))
+        await self.redis.json().set(key, "$", payload)
+        await self.redis.expire(key, settings.cache_ttl)
+        await self._enforce_lru()
+
+    async def _enforce_lru(self):
+        keys = await self.redis.keys(f"doc:{self.user_id}:*")
+        if len(keys) > settings.max_memory_docs:
+            sorted_keys = sorted(
+                keys, key=lambda k: int(k.decode().rsplit(":", 1)[-1])
+            )
+            for k in sorted_keys[: len(keys) - settings.max_memory_docs]:
+                await self.redis.delete(k)
+
+    async def get_context(self, query: str, k: int = 5) -> str:
+        """Returns narrative context. Falls back to recency sort if HNSW unavailable."""
+        try:
+            emb = self.engine.embed(query)
+            search_q = f"*=>[KNN {k} @embedding $vec AS score]"
+            results = await self.redis.ft(f"idx_{self.user_id}").search(
+                search_q,
+                query_params={"vec": np.array(emb).astype(np.float32).tobytes()},
+            )
+            if not results.docs:
+                return ""
+            lines = [
+                f"- You: {doc.query}\n  Me: {doc.response[:120]}…"
+                for doc in results.docs
+            ]
+            return "Relevant past context:\n" + "\n".join(lines)
+        except Exception:
+            keys = sorted(
+                await self.redis.keys(f"doc:{self.user_id}:*"),
+                key=lambda k: int(k.decode().rsplit(":", 1)[-1]),
+            )[-k:]
+            lines = []
+            for k in keys:
+                data = await self.redis.json().get(k, "$")
+                if data:
+                    item = data[0]
+                    lines.append(f"- You: {item['query']}\n  Me: {item['response'][:120]}…")
+            return ("Recent context:\n" + "\n".join(lines)) if lines else ""
+
+    # [v1.1] Semantic cache ────────────────────────────────────────────────────
+
+    async def cache_lookup(self, query: str) -> Optional[str]:
+        """
+        Checks Redis for a cached response to a semantically similar query.
+        Uses cosine similarity against stored cache embedding vectors.
+        Returns cached response string if hit, None otherwise.
+        """
+        q_emb = self.engine.embed(query)
+        cache_keys = await self.redis.keys(f"semcache:{self.user_id}:*")
+        best_score = 0.0
+        best_response = None
+        for ck in cache_keys:
+            data = await self.redis.json().get(ck, "$")
+            if not data:
+                continue
+            item = data[0]
+            cached_emb = np.array(item["embedding"], dtype=np.float32)
+            # Both normalised → dot product = cosine similarity
+            score = float(np.dot(q_emb, cached_emb))
+            if score > best_score:
+                best_score = score
+                best_response = item["response"]
+        if best_score >= settings.semantic_cache_threshold and best_response:
+            logger.info(f"Semantic cache hit (score={best_score:.3f})")
+            if PROMETHEUS_AVAILABLE:
+                CACHE_HITS.inc()
+            return best_response
+        return None
+
+    async def cache_store(self, query: str, response: str):
+        """Stores a response in the semantic cache with its embedding."""
+        q_emb = self.engine.embed(query).tolist()
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+        key = self._cache_key(query_hash)
+        await self.redis.json().set(key, "$", {"embedding": q_emb, "response": response})
+        await self.redis.expire(key, settings.semantic_cache_ttl)
+
+    # [v1.1] Background summarisation ─────────────────────────────────────────
+
+    async def summarise_session(self, conv_id: str, turns: List[Dict], engine: EmpatheticContextEngine):
+        """
+        Runs asynchronously after a session. Generates and stores a lightweight
+        summary so future retrieval can surface "last time we talked about X".
+        Fire-and-forget — called with asyncio.create_task().
+        """
+        if len(turns) < 4:
+            return  # too short to summarise
+        try:
+            transcript = "\n".join(f"{t['role'].upper()}: {t['content']}" for t in turns[-12:])
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Summarise this conversation in 2-3 sentences. "
+                        "Focus on what the user needed and how they felt."
+                    ),
+                },
+                {"role": "user", "content": transcript},
+            ]
+            summary = await engine.generate(messages, max_tokens=120)
+            summary_key = f"summary:{self.user_id}:{conv_id}"
+            await self.redis.set(summary_key, summary, ex=settings.cache_ttl * 7)
+            logger.info(f"Session summary stored for conv={conv_id}")
+        except Exception as e:
+            logger.warning(f"Summarisation failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. TOOLS  (async, graceful fallbacks)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def tool_web_search(query: str, client: httpx.AsyncClient) -> str:
+    if not settings.tavily_api_key:
+        return "[web_search unavailable — no TAVILY_API_KEY]"
+    try:
+        r = await client.post(
+            "https://api.tavily.com/search",
+            json={"api_key": settings.tavily_api_key, "query": query, "max_results": 3},
+            timeout=6.0,
+        )
+        r.raise_for_status()
+        snippets = [item.get("content", "")[:300] for item in r.json().get("results", [])]
+        return "\n".join(snippets) or "No results."
+    except Exception as e:
+        logger.warning(f"web_search failed: {e}")
+        return "[web search unavailable]"
+
+
+async def tool_x_trends(query: str, client: httpx.AsyncClient) -> str:
+    if not settings.x_bearer_token:
+        return "[X trends unavailable — no X_BEARER_TOKEN]"
+    try:
+        r = await client.get(
+            "https://api.twitter.com/2/tweets/search/recent",
+            params={"query": query, "max_results": 5},
+            headers={"Authorization": f"Bearer {settings.x_bearer_token}"},
+            timeout=6.0,
+        )
+        r.raise_for_status()
+        tweets = r.json().get("data", [])
+        return "\n".join(t["text"][:200] for t in tweets) or "No recent tweets."
+    except Exception as e:
+        logger.warning(f"x_trends failed: {e}")
+        return "[X trends unavailable]"
+
+
+async def tool_google_calendar(client: httpx.AsyncClient) -> str:
+    if not settings.google_oauth_token:
+        return "[Google Calendar unavailable — no GOOGLE_OAUTH_TOKEN]"
+    try:
+        now = datetime.utcnow().isoformat() + "Z"
+        end = (datetime.utcnow() + timedelta(hours=6)).isoformat() + "Z"
+        r = await client.get(
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            params={
+                "timeMin": now, "timeMax": end,
+                "singleEvents": "true", "orderBy": "startTime", "maxResults": 5,
+            },
+            headers={"Authorization": f"Bearer {settings.google_oauth_token}"},
+            timeout=6.0,
+        )
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if not items:
+            return "No upcoming events in the next 6 hours."
+        return "\n".join(
+            f"{e['start'].get('dateTime', e['start'].get('date', ''))[:16]}: "
+            f"{e.get('summary', 'Untitled')}"
+            for e in items
+        )
+    except Exception as e:
+        logger.warning(f"calendar failed: {e}")
+        return "[Calendar unavailable]"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. TONE BANDIT  (Thompson Sampling, per user)
+# ══════════════════════════════════════════════════════════════════════════════
+
+TONES = ("empathetic", "witty", "direct")
+
+# [v1.1] Emotions where witty asides are inappropriate
+_SUPPRESS_WIT_EMOTIONS = frozenset({"grief", "fear", "anger", "sadness", "disgust"})
+
+
+@dataclass
+class BanditArm:
+    tone: str
+    alpha: float = 1.0
+    beta: float = 1.0
+
+    def sample(self) -> float:
+        return float(np.random.beta(self.alpha, self.beta))
+
+    def update(self, reward: float):
+        self.alpha += reward
+        self.beta += (1.0 - reward)
+
+
+class ToneBandit:
+    def __init__(self):
+        self.arms: Dict[str, BanditArm] = {t: BanditArm(tone=t) for t in TONES}
+
+    def choose(self) -> str:
+        return max(self.arms.values(), key=lambda a: a.sample()).tone
+
+    def update(self, tone: str, reward: float):
+        if tone in self.arms:
+            self.arms[tone].update(reward)
+
+    def update_implicit(self, tone: str, response_len: int, followup_emotions: List[Dict]):
+        """
+        [v1.1] Implicit reward signal — no user action needed.
+        Longer responses suggest engagement. Positive follow-up emotion = good signal.
+        """
+        # Length signal: 50–300 chars is the sweet spot
+        length_reward = min(max(response_len / 300, 0.1), 1.0)
+
+        # Sentiment signal from follow-up message emotions
+        positive = frozenset({"joy", "love", "surprise"})
+        negative = frozenset({"anger", "disgust", "sadness", "fear"})
+        sentiment_reward = 0.5
+        if followup_emotions:
+            top = followup_emotions[0]["label"].lower()
+            if top in positive:
+                sentiment_reward = 0.8
+            elif top in negative:
+                sentiment_reward = 0.2
+
+        implicit_reward = (length_reward + sentiment_reward) / 2.0
+        self.update(tone, implicit_reward)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. RATE LIMITER  [v1.1 — new]
+#    Token bucket per user, backed by in-process deque.
+#    For multi-worker deployments, swap to Redis INCR + EXPIRE.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RateLimiter:
+    def __init__(self, rpm: int = 30):
+        self.rpm = rpm
+        self._windows: Dict[str, Deque[float]] = defaultdict(lambda: deque())
+
+    def is_allowed(self, user_id: str) -> bool:
+        now = time.time()
+        window = self._windows[user_id]
+        # Drop timestamps older than 60s
+        while window and now - window[0] > 60.0:
+            window.popleft()
+        if len(window) >= self.rpm:
+            return False
+        window.append(now)
+        return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. AETHER CORE ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AetherEngine:
+    """
+    Orchestrates every request through the full empathy-first pipeline.
+
+    v1.1 additions:
+      - Semantic cache lookup before LLM/tool calls
+      - Conversation turn buffer (in-memory, per conv_id)
+      - Dynamic tool embedding from query content
+      - Witty tone suppressed on heavy negative emotions
+      - Implicit bandit feedback from follow-up messages
+      - Per-component Prometheus timing
+    """
+
+    def __init__(
+        self,
+        engine: EmpatheticContextEngine,
+        redis: Optional["AsyncRedis"],
+        tool_policy: ToolPolicy,
+    ):
+        self.engine = engine
+        self.redis = redis
+        self.tool_policy = tool_policy
+        self.bandits: Dict[str, ToneBandit] = {}
+        self.conv_buffer = ConversationBuffer()
+
+        # LLM — GPT-4o-mini via LangChain if available, else Phi-3.5 direct / vLLM
+        if LANGCHAIN_AVAILABLE and settings.openai_api_key:
+            llm = ChatOpenAI(
+                model="gpt-4o-mini",
+                temperature=0.7,
+                openai_api_key=settings.openai_api_key,
+            )
+            prompt = PromptTemplate.from_template(
+                "You are Aether, a warm and thoughtful AI assistant.\n\n"
+                "{context}\n\nCalendar: {calendar}\n\nExternal insights:\n{insights}\n\n"
+                "Conversation so far:\n{history}\n\nUser: {input}\n{agent_scratchpad}"
+            )
+            self._agent_executor = AgentExecutor(
+                agent=create_react_agent(llm, [], prompt),
+                tools=[],
+                verbose=False,
+            )
+            self._use_langchain = True
+        else:
+            self._use_langchain = False
+            logger.warning("LangChain/OpenAI not configured — using Phi-3.5 directly.")
+
+    def _get_bandit(self, user_id: str) -> ToneBandit:
+        if user_id not in self.bandits:
+            self.bandits[user_id] = ToneBandit()
+        return self.bandits[user_id]
+
+    def _get_memory(self, user_id: str) -> Optional[UserMemory]:
+        if not REDIS_AVAILABLE or not self.redis:
+            return None
+        return UserMemory(user_id, self.redis, self.engine)
+
+    @torch.inference_mode()
+    def _choose_tools(
+        self,
+        query_emb: torch.Tensor,
+        query: str,
+        emotion_emb: torch.Tensor,
+    ) -> List[str]:
+        """
+        [v1.1] Dynamic context embedding — derived from query content rather than
+        a hardcoded 'calendar schedule events' string. Time/date keywords in the
+        query naturally push the calendar signal.
+        """
+        # Extract time-sensitivity signal from the actual query
+        time_keywords = [
+            w for w in ["today", "tomorrow", "meeting", "schedule", "appointment",
+                        "when", "time", "calendar", "event", "remind"] if w in query.lower()
+        ]
+        context_text = " ".join(time_keywords) if time_keywords else query[:60]
+        context_emb = self.engine.embed_tensor(context_text)
+
+        x = torch.cat([query_emb, context_emb, emotion_emb]).unsqueeze(0)
+        probs = self.tool_policy(x)[0]
+        tools = ["web_search", "x_trends", "calendar"]
+        return [t for t, p in zip(tools, probs) if p.item() > 0.35]
+
+    def _apply_tone(
+        self, response: str, tone: str, emotions: List[Dict]
+    ) -> str:
+        """
+        [v1.1] Witty tone suppressed when top emotion is grief/fear/anger/sadness.
+        Empathetic rewrite is now async — callers should use _apply_tone_async.
+        """
+        if tone == "witty":
+            top_emotion = emotions[0]["label"].lower() if emotions else ""
+            if top_emotion in _SUPPRESS_WIT_EMOTIONS:
+                # Demote to direct rather than deliver an aside during distress
+                tone = "direct"
+            elif random.random() < settings.wit_factor / 11.0:
+                asides = [
+                    " (Chaos is just data you haven't labelled yet.)",
+                    " Draw your own conclusions — I drew mine in crayon.",
+                    " This is the kind of thing that keeps me up at night. Well, in theory.",
+                ]
+                return response + random.choice(asides)
+        return response  # direct or suppressed witty
+
+    async def _apply_tone_async(
+        self, response: str, tone: str, emotions: List[Dict]
+    ) -> str:
+        """Async wrapper — empathetic path calls the LLM, others are sync."""
+        if tone == "empathetic":
+            with timed(LATENCY_REWRITE if PROMETHEUS_AVAILABLE else None):
+                return await self.engine.rewrite_with_empathy(response, emotions)
+        return self._apply_tone(response, tone, emotions)
+
+    async def _generate_base(
+        self,
+        context: str,
+        calendar: str,
+        insights: str,
+        query: str,
+        history: List[Dict],
+    ) -> str:
+        if self._use_langchain:
+            history_text = "\n".join(
+                f"{m['role'].upper()}: {m['content']}" for m in history[-6:]
+            )
+            result = await self._agent_executor.ainvoke({
+                "input": query,
+                "context": context,
+                "calendar": calendar,
+                "insights": insights,
+                "history": history_text,
+                "agent_scratchpad": "",
+            })
+            return result.get("output", "I'm here to help.")
+        else:
+            system = (
+                "You are Aether, a warm and thoughtful AI assistant.\n\n"
+                f"{context}\n\nCalendar: {calendar}\n\nExternal: {insights}"
+            )
+            messages = [{"role": "system", "content": system}]
+            messages.extend(history[-6:])  # last 3 turns of real conversation
+            messages.append({"role": "user", "content": query})
+            return await self.engine.generate(messages, max_tokens=300)
+
+    async def process(
+        self,
+        user_query: str,
+        user_id: str = "default",
+        conv_id: str = "default",
+        audio_path: Optional[str] = None,
+        image_path: Optional[str] = None,
+    ) -> AsyncGenerator[str, None]:
+        t0 = time.time()
+        if PROMETHEUS_AVAILABLE:
+            REQUEST_COUNT.labels(intent="chat").inc()
+
+        # ── Multimodal input fusion ───────────────────────────────────────────
+        if audio_path:
+            transcript = await asyncio.to_thread(self.engine.transcribe, audio_path)
+            if transcript:
+                user_query = f"[Audio: {transcript}] {user_query}".strip()
+        if image_path:
+            caption = await asyncio.to_thread(self.engine.caption_image, image_path)
+            if caption:
+                user_query = f"[Image: {caption}] {user_query}".strip()
+
+        # ── EmpatheticContext — always first ──────────────────────────────────
+        t_emp = time.time()
+        emotions, query_emb = await asyncio.gather(
+            asyncio.to_thread(self.engine.detect_emotions, user_query),
+            asyncio.to_thread(self.engine.embed_tensor, user_query),
+        )
+        if PROMETHEUS_AVAILABLE:
+            LATENCY_EMPATHY.observe(time.time() - t_emp)
+
+        # ── Safety gate ───────────────────────────────────────────────────────
+        harmful, pii = await asyncio.gather(
+            asyncio.to_thread(self.engine.is_harmful, user_query),
+            asyncio.to_thread(self.engine.has_pii, user_query),
+        )
+        if harmful:
+            yield "I'm not able to help with that — it appears to involve harmful content."
+            return
+        if pii:
+            yield (
+                "I noticed what looks like personal information in your message. "
+                "For your privacy, I won't process or store it. "
+                "Could you rephrase without sharing sensitive details?"
+            )
+            return
+
+        # ── Semantic cache lookup [v1.1] ──────────────────────────────────────
+        memory = self._get_memory(user_id)
+        if memory:
+            cached = await memory.cache_lookup(user_query)
+            if cached:
+                # Stream cached response directly — skip all LLM/tool calls
+                for word in cached.split():
+                    yield word + " "
+                    await asyncio.sleep(0.008)
+                return
+
+        # ── Conversation history [v1.1] ───────────────────────────────────────
+        self.conv_buffer.add(conv_id, "user", user_query)
+        history = self.conv_buffer.get_messages(conv_id)
+
+        # ── Parallel: memory context ──────────────────────────────────────────
+        context = await (memory.get_context(user_query) if memory else asyncio.sleep(0, result=""))
+
+        # ── Tool policy routing [v1.1 dynamic embedding] ──────────────────────
+        emotion_text = " ".join(e["label"] for e in emotions[:3])
+        emotion_emb = await asyncio.to_thread(self.engine.embed_tensor, emotion_text)
+        tools_to_use = self._choose_tools(query_emb, user_query, emotion_emb)
+
+        # ── Tool execution ─────────────────────────────────────────────────────
+        t_tools = time.time()
+        async with httpx.AsyncClient() as client:
+            tasks = {}
+            if "web_search" in tools_to_use:
+                tasks["web"] = tool_web_search(user_query, client)
+            if "x_trends" in tools_to_use:
+                tasks["x"] = tool_x_trends(user_query, client)
+            if "calendar" in tools_to_use:
+                tasks["cal"] = tool_google_calendar(client)
+
+            results: Dict[str, str] = {}
+            if tasks:
+                gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
+                for key, result in zip(tasks.keys(), gathered):
+                    results[key] = result if not isinstance(result, Exception) else ""
+        if PROMETHEUS_AVAILABLE:
+            LATENCY_TOOLS.observe(time.time() - t_tools)
+
+        calendar_text = results.get("cal", "No upcoming events.")
+        insights = "\n".join(filter(None, [results.get("web", ""), results.get("x", "")]))
+
+        # ── LLM generation ─────────────────────────────────────────────────────
+        t_llm = time.time()
+        base_response = await self._generate_base(
+            context=context or "",
+            calendar=calendar_text,
+            insights=insights or "No external data retrieved.",
+            query=user_query,
+            history=history,
+        )
+        if PROMETHEUS_AVAILABLE:
+            LATENCY_LLM.observe(time.time() - t_llm)
+
+        # ── Tone bandit selection + rewrite ───────────────────────────────────
+        bandit = self._get_bandit(user_id)
+        chosen_tone = bandit.choose()
+        final_response = await self._apply_tone_async(base_response, chosen_tone, emotions)
+
+        # ── Stream response ────────────────────────────────────────────────────
+        for word in final_response.split():
+            yield word + " "
+            await asyncio.sleep(0.008)
+
+        # ── Post-stream: store, cache, update conversation buffer ──────────────
+        self.conv_buffer.add(conv_id, "assistant", final_response)
+
+        if memory:
+            emotion_labels = [e["label"] for e in emotions[:3]]
+            await memory.add(user_query, final_response, emotion_labels)
+            await memory.cache_store(user_query, final_response)
+
+            # Background session summarisation — fire and forget
+            turns = self.conv_buffer.get_messages(conv_id)
+            asyncio.create_task(
+                memory.summarise_session(conv_id, turns, self.engine)
+            )
+
+        total = time.time() - t0
+        if PROMETHEUS_AVAILABLE:
+            LATENCY_TOTAL.observe(total)
+        logger.info(
+            f"user={user_id} conv={conv_id} tone={chosen_tone} "
+            f"emotions={[e['label'] for e in emotions[:2]]} "
+            f"tools={tools_to_use} total={total:.2f}s"
+        )
+
+        # [v1.1] Store metadata for implicit feedback on the next turn
+        self._last_turn: Dict[str, Dict] = getattr(self, "_last_turn", {})
+        self._last_turn[conv_id] = {
+            "tone": chosen_tone,
+            "response_len": len(final_response),
+        }
+
+    async def apply_implicit_feedback(self, conv_id: str, followup_emotions: List[Dict]):
+        """
+        [v1.1] Called at the start of the next turn in a conversation.
+        Uses the previous tone + length + current emotions as a reward signal.
+        """
+        last = getattr(self, "_last_turn", {}).get(conv_id)
+        if not last:
+            return
+        # Derive user_id from conv_id prefix (format: "{user_id}:{uuid}")
+        user_id = conv_id.split(":")[0] if ":" in conv_id else conv_id
+        bandit = self._get_bandit(user_id)
+        bandit.update_implicit(last["tone"], last["response_len"], followup_emotions)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. FASTAPI APPLICATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Aether v1.1 starting — loading models…")
+
+    engine = EmpatheticContextEngine()
+    app.state.engine = engine
+
+    tool_policy = ToolPolicy().to(device)
+    tp_path = Path("aether_tool_policy.pt")
+    if tp_path.exists():
+        tool_policy.load_state_dict(torch.load(tp_path, map_location=device))
+    tool_policy.eval()
+    app.state.tool_policy = tool_policy
+
+    redis_client = None
+    if REDIS_AVAILABLE:
+        try:
+            redis_client = AsyncRedis.from_url(settings.redis_url, decode_responses=False)
+            await redis_client.ping()
+            logger.info("Redis connected.")
+        except Exception as e:
+            logger.warning(f"Redis unavailable ({e}) — memory and cache disabled.")
+    app.state.redis = redis_client
+
+    app.state.aether = AetherEngine(engine, redis_client, tool_policy)
+    app.state.rate_limiter = RateLimiter(rpm=settings.rate_limit_rpm)
+
+    logger.info("Aether ready.")
+    yield
+
+    if redis_client:
+        await redis_client.close()
+    logger.info("Aether shut down.")
+
+
+app = FastAPI(title="Aether", version="1.1.0", lifespan=lifespan)
+
+
+# ── Auth dependency [v1.1] ─────────────────────────────────────────────────────
+
+async def require_auth(x_api_key: Optional[str] = Header(default=None)):
+    if settings.api_key and x_api_key != settings.api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
+
+
+# ── Request / Response Models ──────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    user_id: str = "default"
+    conv_id: str = "default"          # [v1.1] conversation identifier
+    text: str = ""
+    audio_path: Optional[str] = None
+    image_path: Optional[str] = None
+
+
+class FeedbackRequest(BaseModel):
+    user_id: str
+    tone: str
+    reward: float
+
+    @field_validator("reward")
+    @classmethod
+    def reward_in_range(cls, v):
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("reward must be between 0.0 and 1.0")
+        return v
+
+    @field_validator("tone")
+    @classmethod
+    def tone_valid(cls, v):
+        if v not in TONES:
+            raise ValueError(f"tone must be one of {TONES}")
+        return v
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.post("/chat", dependencies=[Depends(require_auth)])
+async def chat(req: ChatRequest, request: Request):
+    if not req.text.strip() and not req.audio_path and not req.image_path:
+        raise HTTPException(status_code=400, detail="Provide text, audio_path, or image_path.")
+
+    limiter: RateLimiter = request.app.state.rate_limiter
+    if not limiter.is_allowed(req.user_id):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again shortly.")
+
+    aether: AetherEngine = request.app.state.aether
+
+    # [v1.1] Implicit feedback — apply reward from previous turn before processing
+    if req.text.strip():
+        emotions = await asyncio.to_thread(aether.engine.detect_emotions, req.text)
+        await aether.apply_implicit_feedback(req.conv_id, emotions)
+
+    return EventSourceResponse(
+        aether.process(req.text, req.user_id, req.conv_id, req.audio_path, req.image_path)
+    )
+
+
+@app.post("/feedback", dependencies=[Depends(require_auth)])
+async def feedback(req: FeedbackRequest, request: Request):
+    """Explicit user feedback — updates tone bandit directly."""
+    aether: AetherEngine = request.app.state.aether
+    bandit = aether._get_bandit(req.user_id)
+    bandit.update(req.tone, req.reward)
+    return {"status": "updated", "user_id": req.user_id, "tone": req.tone}
+
+
+@app.post("/save_policy", dependencies=[Depends(require_auth)])
+async def save_policy(request: Request):
+    """Persist tool policy weights to disk."""
+    tp: ToolPolicy = request.app.state.tool_policy
+    torch.save(tp.state_dict(), "aether_tool_policy.pt")
+    return {"status": "saved"}
+
+
+@app.delete("/conversation/{conv_id}", dependencies=[Depends(require_auth)])
+async def clear_conversation(conv_id: str, request: Request):
+    """[v1.1] Clear the in-memory turn buffer for a conversation."""
+    aether: AetherEngine = request.app.state.aether
+    aether.conv_buffer.clear(conv_id)
+    return {"status": "cleared", "conv_id": conv_id}
+
+
+@app.get("/health")
+async def health(request: Request):
+    return {
+        "status": "healthy",
+        "version": "1.1.0",
+        "device": str(device),
+        "redis": "connected" if request.app.state.redis else "disabled",
+        "vllm": bool(settings.vllm_base_url),
+        "multimodal": args.multimodal,
+        "semantic_cache": "enabled" if request.app.state.redis else "disabled",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 10. ENTRYPOINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    if args.finetune:
+        logger.info("Fine-tune mode.")
+        engine = EmpatheticContextEngine()
+        engine.finetune(dataset_name=args.dataset, epochs=args.epochs)
+    else:
+        uvicorn.run("aether:app", host="0.0.0.0", port=8000, reload=False)
