@@ -1,0 +1,54 @@
+Aether — Setup Guide
+
+What changed from SingularityGrok v3
+
+Issue in v3Fix in AetherAdvancedEmpathyModule instantiated per-request (loads multi-GB models every call)EmpatheticContextEngine is a true singleton, loaded once in lifespan()--finetune stub does nothingReal LoRA/SFTTrainer loop, saves adapter weightsService account auth for Google Calendar (breaks for 99% of users)OAuth2 user token via GOOGLE_OAUTH_TOKEN env varEmpathy is post-processing decorationEmpatheticContext runs first on every request; shapes routing, tool selection, and generationif args.finetune: passActual training code with dataset loading, LoRA config, and model savingclass Config (Pydantic v1)model_config = SettingsConfigDict(...) (Pydantic v2)No graceful Redis fallbackFalls back to recency-sorted keys if HNSW index isn't configured 
+
+Installation
+
+# Core pip install fastapi uvicorn[standard] httpx pydantic pydantic-settings \ sse-starlette torch numpy # Transformers stack pip install transformers sentence-transformers datasets \ peft trl bitsandbytes accelerate # Redis (optional, enables memory) pip install redis # LangChain (optional, enables GPT-4o-mini) pip install langchain langchain-openai langchain-community # Prometheus (optional, enables metrics) pip install prometheus-client # Multimodal (optional, enable with --multimodal flag) pip install openai-whisper Pillow # BLIP-2: pip install git+https://github.com/haotian-liu/LAVIS.git 
+
+Configuration (.env)
+
+# Required for LLM (or Phi-3 is used directly) OPENAI_API_KEY=sk-... # Required for web search tool TAVILY_API_KEY=tvly-... # Required for X/Twitter trends tool X_BEARER_TOKEN=AAAA... # Required for Google Calendar tool # Get via OAuth2 flow: https://developers.google.com/calendar/api/quickstart GOOGLE_OAUTH_TOKEN=ya29.... # Redis (enables per-user memory) REDIS_URL=redis://localhost:6379 # Model paths (defaults shown) PHI3_MODEL_NAME=microsoft/Phi-3-mini-4k-instruct PHI3_FINETUNED_PATH=./aether_phi3_finetuned # Tone settings WIT_FACTOR=8.0 # 0.0–11.0, controls frequency of witty asides 
+
+Running
+
+# Standard server uvicorn aether:app --host 0.0.0.0 --port 8000 # With multimodal (Whisper + BLIP) python aether.py --multimodal # Fine-tune Phi-3 on Alpaca (then restart with --load-finetuned) python aether.py --finetune --dataset tatsu-lab/alpaca --epochs 1 # Load fine-tuned weights uvicorn aether:app --host 0.0.0.0 --port 8000 # set PHI3_FINETUNED_PATH in .env 
+
+API
+
+POST /chat
+
+{ "user_id": "alice", "text": "I'm feeling overwhelmed with work today", "audio_path": null, "image_path": null } 
+
+Returns: SSE stream of tokens.
+
+POST /feedback
+
+{ "user_id": "alice", "tone": "empathetic", "reward": 0.9 } 
+
+Updates the Thompson Sampling bandit for that user.
+
+POST /save_policy
+
+Persists tool policy weights to aether_tool_policy.pt.
+
+GET /health
+
+Returns version, device, Redis status.
+
+Docker (Redis + Aether)
+
+version: '3.8' services: redis: image: redis:7-alpine ports: ["6379:6379"] aether: build: . ports: - "8000:8000" - "8001:8001" # Prometheus metrics env_file: .env environment: REDIS_URL: redis://redis:6379 depends_on: [redis] FROM python:3.12-slim WORKDIR /app COPY requirements.txt . RUN pip install --no-cache-dir -r requirements.txt COPY aether.py . EXPOSE 8000 8001 CMD ["uvicorn", "aether:app", "--host", "0.0.0.0", "--port", "8000"] 
+
+Architecture overview
+
+User input (text / audio / image) │ ▼ EmpatheticContextEngine ← runs first, always ├─ Emotion detection → governs tone bandit + Phi-3 rewrite ├─ Harm classifier → hard stop if toxic ├─ PII detector → privacy gate └─ Semantic embedder → feeds memory retrieval + tool policy │ ┌────┴──────────────────────┐ │ │ Tool policy (MLP) Memory retrieval (web / X / calendar) (Redis HNSW) │ │ └──────────┬────────────────┘ ▼ LLM generation (GPT-4o-mini or Phi-3 direct) │ ▼ Tone Bandit (Thompson Sampling) → empathetic (Phi-3 rewrite) → witty (probabilistic aside) → direct (no modification) │ ▼ SSE token stream → client │ ▼ Memory storage + bandit update 
+
+Name rationale
+
+Aether — Adaptive Empathic Thinking, Hearing & Experiential Reasoning
+
+The classical element that permeates and connects all things. Empathy isn't a module here — it's the medium everything else flows through.
+
